@@ -1,0 +1,570 @@
+import json
+import whisper
+import aiofiles
+import requests
+import os
+from aiogram import F, Bot
+from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.types import Message, LabeledPrice, PreCheckoutQuery, CallbackQuery, FSInputFile, ChatJoinRequest
+from aiogram.types import ChatMemberUpdated
+from aiogram.exceptions import TelegramBadRequest
+from aiogram import Router
+import google.generativeai as genai
+from config import GEMINI_API_KEY, TOKEN, CHANNEL_ID, CHANNEL_LINK
+from datetime import datetime, timedelta
+from collections import defaultdict
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+import database.requests as rq
+from noor.instructions import INSTRUCTIONS_OF_AI, greeting
+bot = Bot(token=TOKEN)
+import noor.keyboards as kb
+# File to store chat history
+CHAT_HISTORY_FILE = "chat_history.json"
+USER_PROFILE_FILE = "user_profile.json"
+VOICE_SETTINGS_FILE = "voice_settings.json"
+ALL_USERS_DB = "all_users.json"
+
+class Reg(StatesGroup):
+    user_id = State()
+    ai_name = State()
+    name = State()
+    Experience = State()
+    Approach = State()
+    Mission = State()
+    Commitment = State()
+    CallToAction = State() 
+
+class AdvMsg(StatesGroup):
+    img = State()
+    audio = State()
+    txt = State()
+    inline_link_name = State()
+    inline_link_link = State()
+    
+class GroupMsg(StatesGroup):
+    img = State()
+    audio = State()
+    txt = State()
+    inline_link_name = State()
+    inline_link_link = State()
+
+class Gen(StatesGroup):
+    wait = State()
+
+
+# Load existing chat history from the file
+def load_chat_history():
+    if os.path.exists(CHAT_HISTORY_FILE):
+        with open(CHAT_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    return {}
+#loading existing user_profile
+def load_user_profile():
+    if os.path.exists(USER_PROFILE_FILE):
+        with open(USER_PROFILE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+def load_all_user():
+    if os.path.exists(ALL_USERS_DB):
+        with open(ALL_USERS_DB, "r") as f:
+            return json.load(f)
+    return {}
+# Save chat history to the file
+def save_chat_history():
+    with open(CHAT_HISTORY_FILE, "w") as f:
+        json.dump(user_chat_histories, f, indent=4)
+
+async def generate_the_content(text: str, userid: int):
+    # Ensure user history exists
+    if userid not in user_chat_histories:
+        user_chat_histories[userid] = []
+
+    # Add user message to history
+    user_chat_histories[userid].append({
+        "role": "user",
+        "parts": [{"text": text}]
+    })
+    save_chat_history()
+    chat_session = model.start_chat(history=user_chat_histories[userid])
+    response = await chat_session.send_message_async(text)
+    response_text = response.text
+
+    # Save AI response to history
+    user_chat_histories[userid].append({
+        "role": "model",
+        "parts": [{"text": response_text}]
+    })
+    save_chat_history()
+    return response_text
+    
+# Initialize user chat history
+user_chat_histories = load_chat_history()
+user_profile = load_user_profile()
+# Ensure dictionary format
+if not isinstance(user_chat_histories, dict):
+    user_chat_histories = {}
+
+class UserLimitManager:
+    def __init__(self, max_daily_limit=5):
+        self.max_daily_limit = max_daily_limit
+        self.user_limits = defaultdict(dict)
+        self.filename = "user_limits.json"
+        self.load_limits()
+
+    def load_limits(self):
+        try:
+            with open(self.filename, 'r') as f:
+                data = json.load(f)
+                for user_id, info in data.items():
+                    self.user_limits[user_id] = {
+                        'count': info['count'],
+                        'last_reset': datetime.fromisoformat(info['last_reset']),
+                    }
+        except FileNotFoundError:
+            pass
+
+    def save_limits(self):
+        data = {
+            user_id: {
+                'count': info['count'],
+                'last_reset': info['last_reset'].isoformat()
+            }
+            for user_id, info in self.user_limits.items()
+        }
+        with open(self.filename, 'w') as f:
+            json.dump(data, f)
+
+    def check_and_reset_daily(self, user_id):
+        user_id = str(user_id)
+        if user_id not in self.user_limits:
+            self.user_limits[user_id] = {'count': 0, 'last_reset': datetime.now()}
+        
+        last_reset = self.user_limits[user_id]['last_reset']
+        if datetime.now() - last_reset > timedelta(hours=1):
+            self.user_limits[user_id] = {'count': 0, 'last_reset': datetime.now()}
+    def funded_limites(self, user_id):
+        user_id = str(user_id)
+        x = int(self.user_limits[user_id]['count'])
+        y = self.user_limits[user_id]['last_reset']
+        self.user_limits[user_id] = {'count': x-10, 'last_reset': y}
+
+    async def use_limit(self, user_id):
+        user_id = str(user_id)
+        self.check_and_reset_daily(user_id)
+
+        if self.user_limits[user_id]['count'] >= self.max_daily_limit:
+            reset_time = self.user_limits[user_id]['last_reset'] + timedelta(hours=1)
+            return False, 0, reset_time
+
+        self.user_limits[user_id]['count'] += 1
+        remaining = self.max_daily_limit - self.user_limits[user_id]['count']
+        self.save_limits()
+        return True, remaining, None
+# Configure the AI model
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    system_instruction=INSTRUCTIONS_OF_AI
+)
+
+
+
+router = Router()
+limit_manager = UserLimitManager(max_daily_limit=20)
+hi_message = greeting
+pending_requests = set()
+
+
+
+@router.chat_join_request()
+async def handle_join_request(update: ChatJoinRequest):
+    pending_requests.add(update.from_user.id)
+    # Optionally notify admins or log the request
+
+@router.my_chat_member()
+async def handle_new_chat(update: ChatMemberUpdated):
+    chat_id = update.chat.id
+    await rq.set_group(chat_id)
+    # Save chat_id to your database or list
+
+@router.channel_post()
+async def forward_channel_post(message: Message):
+    """Forwards messages from the channel to a all users in bot, the channel you created to accept the requests 
+    will be the target channel(posts from this channel will be listened and forwarded to all users)."""
+    for user in await rq.get_all_user_ids():
+        try:
+            await bot.forward_message(from_chat_id=CHANNEL_ID,chat_id=user, message_id=message.message_id)
+        except Exception as e:
+            await message.answer(f"Unexpected error: {e}")
+
+@router.message(CommandStart())
+async def start(message: Message):
+    user_id = message.from_user.id
+    await rq.set_user(tg_id=user_id)
+    await message.answer(f"Hi\Привет {message.from_user.full_name}\n {hi_message}", reply_markup=kb.settings)
+
+    
+@router.message(Command("narrator")) #// /narrator 123456, all users will recieve 123456
+async def narrator(message: Message, command: CommandObject):
+    for user in await rq.get_all_user_ids():
+        await bot.send_message(chat_id=user, text=command.args)
+
+
+
+@router.callback_query(F.data == "subchek")
+async def subchek(callback: CallbackQuery):
+    await callback.answer("Your are okay to go")
+    
+
+@router.callback_query(F.data == 'history_callback')
+async def history_callback(callback: CallbackQuery):
+    try:
+        await callback.answer("History: show")
+        user_id = str(callback.from_user.id)
+        
+        if user_id not in user_chat_histories or not user_chat_histories[user_id]:
+            await callback.message.edit_text("📜 No chat history found. \n История чата не найдена", reply_markup=kb.back_to_main)
+            return
+
+        history_text = "\n\n".join(
+            f"{entry['role'].capitalize()}: {entry['parts'][0]['text']}"
+            for entry in user_chat_histories[user_id]
+        )
+
+        await callback.message.edit_text(f"📜 Chat History/История чата:\n\n{history_text}", reply_markup=kb.back_to_main)
+    except TelegramBadRequest as e:
+        if 'MESSAGE_TOO_LONG' in str(e):
+            await callback.message.edit_text(f"Error: {e}. Message is too long, Should i converit it to txt file?.", reply_markup=kb.history_text)
+        else:
+            await callback.message.edit_text(f"An error occurred: {e}")
+
+@router.callback_query(F.data == "send_as_file_history")
+async def send_as_file_history(callback: CallbackQuery):
+    await callback.answer("Proccesing...")
+    user_id = str(callback.from_user.id)
+    history_text = "\n\n".join(
+            f"{entry['role'].capitalize()}: {entry['parts'][0]['text']}"
+            for entry in user_chat_histories[user_id]
+        )
+    file_hist_name = f"history{user_id}.txt"
+    with open(file_hist_name, 'w', encoding="utf-8") as history_file:
+        history_file.write(history_text)
+    hist_doc = FSInputFile(file_hist_name, filename=f"output_{file_hist_name}_{callback.from_user.id}.txt")
+    await callback.message.answer_document(hist_doc, caption="Here is your history in txt file ⬆️")
+    os.remove(file_hist_name)
+
+    
+@router.callback_query(F.data == "fundup")
+async def fundup(callback: CallbackQuery):
+    await callback.answer("Proccesing...")
+    await callback.message.answer_invoice(
+        title="Extend limits/Расширить дневные лимиты",
+        description="Your going to extend you limit by 10 additional tries/Вы собираетесь продлить свой лимит на 10 дополнительных попыток.",
+        payload='fundup_limits',
+        currency="XTR",
+        prices=[LabeledPrice(label="XTR", amount=1)]
+    )
+
+
+@router.callback_query(F.data == "back")
+async def back(callback: CallbackQuery):
+    await callback.message.edit_text(hi_message, reply_markup=kb.settings)
+
+@router.callback_query(F.data == "profile")
+async def profileus(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("😍")
+    await callback.message.edit_text("Here you can create or see your profile💼", reply_markup=kb.profile_settings)
+    
+@router.callback_query(F.data == "show_users_profliee")
+async def show_users_profliee(callback: CallbackQuery):
+    user_id = str(callback.from_user.id)
+    try:
+        await callback.message.edit_text(f"Here is your profile: \n👤 Your_name: {user_profile[user_id]['name']} \n💼 Your_exp_job: {user_profile[user_id]['Experience']} \n💡 My_Approach: {user_profile[user_id]['Approach']} \n🚀 My_Mission: {user_profile[user_id]['Mission']} \n🔒 My_Commitment: {user_profile[user_id]['Commitment']} \n📞 Your_CallToAction: {user_profile[user_id]['CallToAction']} \n🤖 My_ai_name: {user_profile[user_id]['ai_name']}", reply_markup=kb.profile_settings)
+    except KeyError:
+        await callback.message.edit_text("You dont have a profile yet so you should create one", reply_markup=kb.profile_creating)
+
+
+@router.callback_query(F.data == "create_update_profile")
+async def create_update_profile(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("💼")
+    await state.set_state(Reg.name)
+    await callback.message.answer("How should I call you? Write just your name (e.g. Noor, Licensed Therapist) \n Как мне к вам обращаться? Напишите только имя (например, Нур, лицензированный терапевт)")
+
+@router.message(Command("send_to_all_users"))
+async def start_send_to_all(message: Message, state: FSMContext):
+    await state.set_state(AdvMsg.img)
+    await message.answer("send your img🖼️")
+
+
+@router.message(AdvMsg.img)
+async def ads_img(message: Message, state: FSMContext):
+    photo_data = { "photo": message.photo }  # Ensure it's in dictionary format
+    await state.update_data(img=message.photo[-1].file_id)
+    await state.set_state(AdvMsg.txt)
+    await message.answer("send your text🗄️")
+
+@router.message(AdvMsg.txt)
+async def ads_txt(message: Message, state: FSMContext):
+    await state.update_data(txt=message.text)
+    await state.set_state(AdvMsg.inline_link_name)
+    await message.answer("send your inline_link name📛")
+
+@router.message(AdvMsg.inline_link_name)
+async def ads_lk_name(message: Message, state: FSMContext):
+    await state.update_data(inline_link_name=message.text)
+    await state.set_state(AdvMsg.inline_link_link)
+    await message.answer("send your inline_link LINK🔗")
+
+@router.message(AdvMsg.inline_link_link)
+async def ads_final(message: Message, state: FSMContext):
+    await state.update_data(inline_link_link=message.text)
+    data = await state.get_data()
+    new_inline_kb = kb.create_markap_kb(name=data['inline_link_name'], url=data['inline_link_link'])
+    if new_inline_kb == None:
+        for user in await rq.get_all_user_ids():
+            if data['img']:
+                await bot.send_photo(chat_id=user, photo=data['img'],caption=data['txt'])
+            elif data['audio']:
+                await bot.send_voice(chat_id=user, voice=data['audio'], caption=data["txt"])
+
+    else:
+        for user in await rq.get_all_user_ids():
+            if data['img']:
+                await bot.send_photo(chat_id=user, photo=data['img'],caption=data['txt'], reply_markup=new_inline_kb)
+            elif data['audio']:
+                await bot.send_voice(chat_id=user, voice=data['audio'], caption=data["txt"], reply_markup=new_inline_kb)
+
+
+    await state.clear()
+
+@router.message(Command("send_to_all_groups"))
+async def start_send_to_all_GroupMsg(message: Message, state: FSMContext):
+    await state.set_state(GroupMsg.img)
+    await message.answer("send your img🖼️")
+
+
+@router.message(GroupMsg.img)
+async def ads_img_GroupMsg(message: Message, state: FSMContext):
+    photo_data = { "photo": message.photo }  # Ensure it's in dictionary format
+    await state.update_data(img=message.photo[-1].file_id)
+    await state.set_state(GroupMsg.txt)
+    await message.answer("send your text🗄️")
+
+@router.message(GroupMsg.txt)
+async def ads_txtGroupMsg(message: Message, state: FSMContext):
+    await state.update_data(txt=message.text)
+    await state.set_state(GroupMsg.inline_link_name)
+    await message.answer("send your inline_link name📛")
+
+@router.message(GroupMsg.inline_link_name)
+async def ads_lk_nameGroupMsg(message: Message, state: FSMContext):
+    await state.update_data(inline_link_name=message.text)
+    await state.set_state(GroupMsg.inline_link_link)
+    await message.answer("send your inline_link LINK🔗")
+
+@router.message(GroupMsg.inline_link_link)
+async def ads_finalGroupMsg(message: Message, state: FSMContext):
+    await state.update_data(inline_link_link=message.text)
+    data = await state.get_data()
+    new_inline_kb = kb.create_markap_kb(name=data['inline_link_name'], url=data['inline_link_link'])
+    if new_inline_kb == None:
+        for user in await rq.get_all_groups_ids():
+            if data['img']:
+                await bot.send_photo(chat_id=user, photo=data['img'],caption=data['txt'])
+            elif data['audio']:
+                await bot.send_voice(chat_id=user, voice=data['audio'], caption=data["txt"])
+
+    else:
+        for user in await rq.get_all_groups_ids():
+            if data['img']:
+                await bot.send_photo(chat_id=user, photo=data['img'],caption=data['txt'], reply_markup=new_inline_kb)
+            elif data['audio']:
+                await bot.send_voice(chat_id=user, voice=data['audio'], caption=data["txt"], reply_markup=new_inline_kb)
+
+
+    await state.clear()
+
+@router.message(Gen.wait)
+async def stop_flood(message: Message):
+    await message.answer("Wait one requests at a time \nПодождите ваш запрос генерируется.")
+
+
+
+
+@router.message(Command("reg"))
+async def reg_name(message: Message, state: FSMContext):
+    await state.set_state(Reg.name)
+    await message.answer("How should i call you?(e.g. Noor, Licensed Therapist) \n Как мне к вам обращаться? Напишите только имя (например, Нур, лицензированный терапевт)")
+
+@router.message(Reg.name)
+async def reg_exp(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(Reg.Experience)
+    await message.answer('What do you do(e.g. junior designer, pro programmer, actor. If private leave "private") \n Чем вы занимаетесь (например, младший дизайнер, профессиональный программист, актер. Если вы частный, оставьте «частный»)')
+
+@router.message(Reg.Experience)
+async def reg_approach(message: Message, state: FSMContext):
+    await state.update_data(Experience=message.text)
+    await state.set_state(Reg.Approach)
+    await message.answer("How should i approach you? e.g.: \n(Direct, data-driven, and pragmatic—no fluff, just solutions)\n Как мне к вам обращаться? (Прямо, основано на данных и прагматично — без лишних слов, только решения)\n(Слыш, просто на чилях, не веди себя как чушпан, пиши только годные вещи)")
+
+@router.message(Reg.Approach)
+async def reg_Mission(message: Message, state: FSMContext):
+    await state.update_data(Approach=message.text)
+    await state.set_state(Reg.Mission)
+    await message.answer('What is my mission?(e.g. Helping you overcome obstacles and optimize mental performance, Help me to overcome procrastination) \n Какова моя миссия? (Например: Помогать вам преодолевать препятствия и оптимизировать умственную продуктивность, Помоги мне справиться с прокрастинацией)')
+
+
+@router.message(Reg.Mission)
+async def reg_Commitment(message: Message, state: FSMContext):
+    await state.update_data(Mission=message.text)
+    await state.set_state(Reg.Commitment)
+    await message.answer("How should i be commited?(e.g. Absolute confidentiality and clear guidance)\n Как я должен быть предан делу? (Например: Абсолютная конфиденциальность и четкие инструкции) \n (Сделай шутки про мои проблемы и в конце добавь какой фильм соответствует моей проблеме)")
+
+@router.message(Reg.Commitment)
+async def reg_CallToAction(message: Message, state: FSMContext):
+    await state.update_data(Commitment=message.text)
+    await state.set_state(Reg.CallToAction)
+    await message.answer("Write your typical Call-To-Action(e.g. Ready to tackle challenges? Let's get to work) \n Какой у тебя типичный призыв к действию? (Например: Готов разобраться с проблемами? Давай работать) \n (Слыш ты как телка небудь, давай ради родителей и детей пахай, ты через 5 лет собой будешь гордится)")
+
+@router.message(Reg.CallToAction)
+async def reg_ainame(message: Message, state: FSMContext):
+    await state.update_data(CallToAction=message.text)
+    await state.set_state(Reg.ai_name)
+    await message.answer("What name you prefer to me(e.g. Alex, Noor, Optimus, Elon, Temur, SquidPuppy) \n Какое имя ты предпочитаешь для меня? (Например: Алекс, Нур, Оптимус, Илон, Темур, SquidPuppy)")
+
+@router.message(Reg.ai_name)
+async def reg_finish(message: Message, state:FSMContext):
+    userid = str(message.from_user.id)
+    await state.update_data(ai_name=message.text)
+    await state.update_data(user_id=userid)
+    data = await state.get_data()
+    data = {
+            userid: {
+                'ai_name': data["ai_name"],
+                'name': data["name"],
+                'Experience': data["Experience"],
+                'Approach': data["Approach"],
+                'Mission': data["Mission"],
+                'Commitment': data["Commitment"],
+                'CallToAction': data["CallToAction"]
+            }
+            
+    }
+    userid_data = data[userid]
+    one_row_data = '"' + "userid: " + ", ".join(f"{key}={value}" for key, value in userid_data.items()) + '"'
+    if userid not in user_chat_histories:
+            user_chat_histories[userid] = []
+
+        # Add user message to history
+    user_chat_histories[userid].append({
+        "role": "user",
+        "parts": [{"text": one_row_data}]
+    })
+    save_chat_history()
+    with open(USER_PROFILE_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+    global user_profile  # Important: Access the global variable
+    user_profile.update(data) # Update in-memory data
+    # user_profile = load_user_profile() # <--- OLD CODE
+    await message.answer(f"You fineshed up you registration.....🎊 \n Вы завершили регистрацию... \n {data}")
+    await state.clear()
+
+
+
+### testing / for developers and those who understand only
+# @router.message(Command("jasur"))
+# async def jasur(message: Message):
+#     result = await bot.get_star_transactions(offset=0, limit=100)
+#     with open("txt.txt", 'w', encoding="utf-8") as files:
+#         files.write(str(result.transactions))# you should use the last star_transaction since the time zone may not match, or you can calculate the time zone and find the transaction you want
+#     await bot.refund_star_payment(user_id=message.from_user.id, telegram_payment_charge_id='stxzmNSmhzhfmd9CMdU7qvRCXhWIcZCrLBsptM7nPY1cLd1PL_xJ71V0m6fJfp0B4qNvI4civuX44nh89MrltZGA-P5tugfYe8gUvhk8rHkd6o')
+### testing / for developers and those who understand only
+
+
+@router.message(Command('fund'))
+async def start_fund(message: Message):
+    await message.answer_invoice(
+        title="Extend limits/Расширить дневные лимиты",
+        description="Your going to extend you limit by 10 additional tries/Вы собираетесь продлить свой лимит на 10 дополнительных попыток.",
+        payload='fundup_limits',
+        currency="XTR",
+        prices=[LabeledPrice(label="XTR", amount=1)]
+    )
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(event: PreCheckoutQuery):
+    await event.answer(True)
+
+
+
+
+
+@router.message(F.successful_payment.invoice_payload == "fundup_limits")
+async def successful_payment(message: Message):
+    user_id = str(message.from_user.id)
+    await bot.refund_star_payment(message.from_user.id, message.successful_payment.telegram_payment_charge_id) # for testing purposes \ it will refund the stars a.k.a it will give your stars(money) back, use it for test purposes
+    can_proceed, remaining_limits, reset_time = await limit_manager.use_limit(user_id)
+    limit_manager.funded_limites(user_id=user_id)
+    await message.reply(f"✅ LIMIT check! {remaining_limits} uses remaining today.\n ✅ ПРОВЕРка ЛИМИТА! {remaining_limits} Попыток на сегодня.")
+
+    await message.answer("Your stuff has been updated😍\n Ваши материалы обновлены😍", reply_markup=kb.back_to_main)
+###
+
+
+
+@router.message(Command('history'))
+async def user_history(message: Message):
+    user_id = str(message.from_user.id)
+    
+    if user_id not in user_chat_histories or not user_chat_histories[user_id]:
+        await message.answer("📜 No chat history found. \n История чата не найдена")
+        return
+
+    history_text = "\n\n".join(
+        f"{entry['role'].capitalize()}: {entry['parts'][0]['text']}"
+        for entry in user_chat_histories[user_id]
+    )
+
+    await message.answer(f"📜 Chat History/История чата:\n\n{history_text}")
+
+@router.message(Command('end'))
+async def end_current(message: Message):
+    user_id = str(message.from_user.id)
+    user_chat_histories[user_id] = []  # Clear history for new conversation
+    save_chat_history()
+    await message.answer("🚮 History has been cleared \n 🚮История была очищена.")
+
+@router.message(Command('new'))
+async def end_current_start_new(message: Message):
+    user_id = str(message.from_user.id)
+    user_chat_histories[user_id] = []  # Clear history for new conversation
+    save_chat_history()
+    await message.answer("🔄 New chat session started. \n 🔄 Начался новый сеанс чата")
+
+
+@router.message(F.text)
+async def the_text(message: Message, state: FSMContext):
+    try:
+
+        if message.text == None:
+            return
+        await state.set_state(Gen.wait)
+        user_id = str(message.from_user.id)  # Convert to string for JSON compatibility
+        can_proceed, remaining_limits, reset_time = await limit_manager.use_limit(user_id)
+
+        if not can_proceed:
+            reset_time_str = reset_time.strftime("%Y-%m-%d %H:%M:%S")
+            await message.reply(f"⛔️ You've reached your daily limit. Limits reset at: {reset_time_str} \n ⛔️ Вы использовали все сегодняшние попытки. Лимит перезагрузится в: {reset_time_str} \nyou can buy additional limits by running '/fund'")
+            return
+
+        sent_message = await message.answer("Doing something important, probably...\n Веду глубокую беседу со своими мозгами ", parse_mode="HTMl")
+
+        x = await generate_the_content(message.text,user_id)
+
+        await sent_message.edit_text(x, parse_mode="HTMl")
+        await state.clear()
+    except Exception as e:
+        await message.answer(f"You have got an error pls chat with admin:\n{e}")
