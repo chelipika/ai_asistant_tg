@@ -1,7 +1,4 @@
 import json
-import whisper
-import aiofiles
-import requests
 import os
 from aiogram import F, Bot
 from aiogram.filters import CommandStart, Command, CommandObject
