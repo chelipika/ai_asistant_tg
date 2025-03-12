@@ -34,7 +34,6 @@ To set up the bot, follow these steps:
      GEMINI_API_KEY = 'your_gemini_api_key'
      TOKEN = 'your_telegram_bot_token'
      CHANNEL_ID = 'your_channel_id'
-     CHANNEL_LINK = 'your_channel_link'
      ```
 
 4. **Run the bot**:
