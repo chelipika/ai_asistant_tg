@@ -10,7 +10,7 @@ from aiogram.types import ChatMemberUpdated
 from aiogram.exceptions import TelegramBadRequest
 from aiogram import Router
 import google.generativeai as genai
-from config import GEMINI_API_KEY, TOKEN, CHANNEL_ID, CHANNEL_LINK
+from config import GEMINI_API_KEY, TOKEN, CHANNEL_ID
 from datetime import datetime, timedelta
 from collections import defaultdict
 from aiogram.fsm.state import StatesGroup, State
