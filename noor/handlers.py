@@ -161,7 +161,7 @@ class UserLimitManager:
 # Configure the AI model
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=INSTRUCTIONS_OF_AI
 )
 
@@ -565,3 +565,4 @@ async def the_text(message: Message, state: FSMContext):
         await state.clear()
     except Exception as e:
         await message.answer(f"You have got an error pls chat with admin:\n{e}")
+
